@@ -3,7 +3,7 @@ name: Update AUR package
 on:
   workflow_dispatch:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '3,18,33,48 * * * *'
 
 permissions:
   actions: write
