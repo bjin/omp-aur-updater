@@ -1,0 +1,296 @@
+name: Update AUR package
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  gate:
+    name: Cancel overlapping scheduled run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel this scheduled run if a previous run is active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs_json=$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" -f status=in_progress -F per_page=100)
+          older_run=$(RUNS_JSON="$runs_json" python3 <<'PY'
+          import json
+          import os
+
+          current = int(os.environ["GITHUB_RUN_ID"])
+          workflow = os.environ["GITHUB_WORKFLOW"]
+          runs = json.loads(os.environ["RUNS_JSON"])["workflow_runs"]
+          older = [
+              run["id"]
+              for run in runs
+              if run.get("name") == workflow and int(run["id"]) < current
+          ]
+          print(older[0] if older else "")
+          PY
+          )
+          if [ -n "$older_run" ]; then
+            echo "Run $older_run is still in progress; canceling current scheduled run $GITHUB_RUN_ID."
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel"
+            sleep 30
+          fi
+
+  prepare:
+    name: Update package metadata
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      version: ${{ steps.update.outputs.version }}
+    steps:
+      - name: Install SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/aur_known_hosts
+          aur_fingerprint=$(ssh-keygen -lf ~/.ssh/aur_known_hosts -E sha256 | awk '{print $2}')
+          if [ "$aur_fingerprint" != 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ]; then
+            echo "Unexpected aur.archlinux.org SSH host key fingerprint: $aur_fingerprint" >&2
+            exit 1
+          fi
+          cat ~/.ssh/aur_known_hosts >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+
+      - name: Clone AUR package
+        run: git clone ssh://aur@aur.archlinux.org/oh-my-pi-bin.git aur
+
+      - name: Update PKGBUILD and .SRCINFO
+        id: update
+        working-directory: aur
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          ASSET_NAME = "omp-linux-x64"
+          RELEASE_URL = "https://api.github.com/repos/can1357/oh-my-pi/releases/latest"
+
+          def fetch_json(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "oh-my-pi-aur-updater"})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def fetch_bytes(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "oh-my-pi-aur-updater"})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return response.read()
+
+          def version_tuple(value):
+              return tuple(int(part) for part in value.split("."))
+
+          def asset_sha256(assets):
+              for asset in assets:
+                  if asset.get("name") != ASSET_NAME:
+                      continue
+                  digest = asset.get("digest") or ""
+                  if not digest:
+                      raise SystemExit(f"Asset {ASSET_NAME} has no digest")
+                  return digest[7:] if digest.startswith("sha256:") else digest
+              raise SystemExit(f"Asset {ASSET_NAME} not found")
+
+          def format_sha256sums(values):
+              return "\n".join([
+                  f"sha256sums=('{values[0]}'",
+                  f"            '{values[1]}')",
+              ])
+
+          content = open("PKGBUILD", encoding="utf-8").read()
+          match = re.search(r"^pkgver=(\S+)", content, re.MULTILINE)
+          if not match:
+              raise SystemExit("Could not find pkgver in PKGBUILD")
+          current = match.group(1)
+
+          release = fetch_json(RELEASE_URL)
+          tag_name = release.get("tag_name", "")
+          if not tag_name.startswith("v"):
+              raise SystemExit(f"Unexpected tag_name: {tag_name}")
+          latest = tag_name[1:]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={latest}\n")
+
+          if version_tuple(latest) <= version_tuple(current):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("changed=false\n")
+              print(f"already up to date: {current}")
+              sys.exit(0)
+
+          binary_sha = asset_sha256(release.get("assets", []))
+          license_bytes = fetch_bytes(f"https://raw.githubusercontent.com/can1357/oh-my-pi/v{latest}/LICENSE")
+          license_sha = hashlib.sha256(license_bytes).hexdigest()
+
+          content = re.sub(r"^pkgver=\S+", f"pkgver={latest}", content, flags=re.MULTILINE)
+          content = re.sub(r"^pkgrel=\S+", "pkgrel=1", content, flags=re.MULTILINE)
+          content, replaced = re.subn(
+              r"sha256sums=\((?:\s*'[0-9a-f]+'\s*)+\)",
+              format_sha256sums([binary_sha, license_sha]),
+              content,
+              count=1,
+          )
+          if replaced != 1:
+              raise SystemExit("Could not find sha256sums array in PKGBUILD")
+          open("PKGBUILD", "w", encoding="utf-8").write(content)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("changed=true\n")
+          print(f"updated: {current} -> {latest}")
+          PY
+
+          changed=$(awk -F= '$1 == "changed" { value = $2 } END { print value }' "$GITHUB_OUTPUT")
+          if [ "$changed" = "true" ]; then
+            docker run --rm -v "$PWD:/pkg" archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed pacman-contrib
+              useradd -m builder
+              chown -R builder:builder /pkg
+              cd /pkg
+              su builder -c "makepkg --printsrcinfo > .SRCINFO"
+            '
+          fi
+
+      - name: Upload updated package metadata
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-metadata
+          path: |
+            aur/PKGBUILD
+            aur/.SRCINFO
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build and smoke test in Arch
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-metadata
+          path: aur
+
+      - name: Build package in clean Arch chroot
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged -v "$PWD/aur:/pkg" archlinux:base-devel bash -lc '
+            set -euo pipefail
+            pacman -Syu --noconfirm --needed devtools sudo
+            useradd -m builder
+            echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
+            chown -R builder:builder /pkg
+            su builder -c "cd /pkg && extra-x86_64-build -- --noconfirm"
+          '
+
+      - name: Smoke test built package in fresh Arch container
+        run: |
+          set -euo pipefail
+          package_path=$(python3 - <<'PY'
+          from pathlib import Path
+          packages = sorted(Path("aur").glob("*.pkg.tar.zst"), key=lambda path: path.stat().st_mtime)
+          if not packages:
+              raise SystemExit("No built package found")
+          print(packages[-1])
+          PY
+          )
+          docker run --rm -v "$PWD:/work:ro" archlinux:base-devel bash -lc '
+            set -euo pipefail
+            pacman -Syu --noconfirm
+            pacman -U --noconfirm "/work/'"$package_path"'"
+            runtime=$(mktemp -d)
+            export HOME="$runtime/home"
+            export XDG_DATA_HOME="$runtime/xdg"
+            mkdir -p "$HOME" "$XDG_DATA_HOME"
+            omp --version
+            omp --help >/dev/null
+            omp completions bash >/dev/null
+            omp completions zsh >/dev/null
+            omp completions fish >/dev/null
+          '
+
+  publish:
+    name: Commit and push to AUR
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.changed == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/aur_known_hosts
+          aur_fingerprint=$(ssh-keygen -lf ~/.ssh/aur_known_hosts -E sha256 | awk '{print $2}')
+          if [ "$aur_fingerprint" != 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ]; then
+            echo "Unexpected aur.archlinux.org SSH host key fingerprint: $aur_fingerprint" >&2
+            exit 1
+          fi
+          cat ~/.ssh/aur_known_hosts >> ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+
+      - name: Clone AUR package
+        run: git clone ssh://aur@aur.archlinux.org/oh-my-pi-bin.git aur
+
+      - name: Download package metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-metadata
+          path: updated
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp updated/PKGBUILD updated/.SRCINFO aur/
+          cd aur
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          git config user.name 'Bin Jin'
+          git config user.email 'bjin@protonmail.com'
+          git add PKGBUILD .SRCINFO
+          git commit -m "upstream release: ${VERSION}"
+          # Keep the AUR push as the final side effect; rerun the workflow if the first push attempt fails.
+          git push origin master
