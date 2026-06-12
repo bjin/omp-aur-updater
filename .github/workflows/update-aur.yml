@@ -292,5 +292,4 @@ jobs:
           git config user.email 'bjin@protonmail.com'
           git add PKGBUILD .SRCINFO
           git commit -m "upstream release: ${VERSION}"
-          # Keep the AUR push as the final side effect; rerun the workflow if the first push attempt fails.
           git push origin master
