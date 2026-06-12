@@ -199,16 +199,16 @@ jobs:
           name: aur-metadata
           path: aur
 
-      - name: Build package in clean Arch chroot
+      - name: Build package in fresh Arch container
         run: |
           set -euo pipefail
-          docker run --rm --privileged -v "$PWD/aur:/pkg" archlinux:base-devel bash -lc '
+          docker run --rm -v "$PWD/aur:/pkg" archlinux:base-devel bash -lc '
             set -euo pipefail
-            pacman -Syu --noconfirm --needed devtools sudo
+            pacman -Syu --noconfirm
             useradd -m builder
-            echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
             chown -R builder:builder /pkg
-            su builder -c "cd /pkg && extra-x86_64-build -- --noconfirm"
+            cd /pkg
+            su builder -c "makepkg -Csf --noconfirm"
           '
 
       - name: Smoke test built package in fresh Arch container
