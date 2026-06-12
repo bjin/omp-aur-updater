@@ -1,0 +1,21 @@
+name: Cron Debug
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show trigger context
+        run: |
+          date -u
+          echo "event_name=${{ github.event_name }}"
+          echo "schedule=${{ github.event.schedule }}"
+          echo "ref=${{ github.ref }}"
+          echo "sha=${{ github.sha }}"
