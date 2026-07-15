@@ -6,45 +6,15 @@ on:
     - cron: "12,32,52 * * * *"
 
 permissions:
-  actions: write
   contents: read
 
+concurrency:
+  group: update-aur-oh-my-pi-bin
+  cancel-in-progress: false
+
 jobs:
-  gate:
-    name: Cancel overlapping scheduled run
-    runs-on: ubuntu-latest
-    steps:
-      - name: Cancel this scheduled run if a previous run is active
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          runs_json=$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" -f status=in_progress -F per_page=100)
-          older_run=$(RUNS_JSON="$runs_json" python3 <<'PY'
-          import json
-          import os
-
-          current = int(os.environ["GITHUB_RUN_ID"])
-          workflow = os.environ["GITHUB_WORKFLOW"]
-          runs = json.loads(os.environ["RUNS_JSON"])["workflow_runs"]
-          older = [
-              run["id"]
-              for run in runs
-              if run.get("name") == workflow and int(run["id"]) < current
-          ]
-          print(older[0] if older else "")
-          PY
-          )
-          if [ -n "$older_run" ]; then
-            echo "Run $older_run is still in progress; canceling current scheduled run $GITHUB_RUN_ID."
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel"
-            sleep 30
-          fi
-
   prepare:
     name: Update package metadata
-    needs: gate
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.update.outputs.changed }}

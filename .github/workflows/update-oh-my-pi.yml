@@ -2,9 +2,8 @@ name: Update oh-my-pi AUR package and pacman repo
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types:
-      - oh-my-pi-nix-master
+  schedule:
+    - cron: "18,38,58 * * * *"
 
 permissions:
   contents: write
@@ -22,18 +21,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Show trigger context
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SOURCE_REPOSITORY: ${{ github.event.client_payload.repository || github.repository }}
-          SOURCE_REF: ${{ github.event.client_payload.ref || github.ref }}
-          SOURCE_SHA: ${{ github.event.client_payload.sha || github.sha }}
-        run: |
-          echo "event=$EVENT_NAME"
-          echo "source_repository=$SOURCE_REPOSITORY"
-          echo "source_ref=$SOURCE_REF"
-          echo "source_sha=$SOURCE_SHA"
 
       - name: Install SSH key
         env:
