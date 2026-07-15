@@ -1,4 +1,4 @@
-name: Update AUR package (oh-my-pi)
+name: Update oh-my-pi AUR package
 
 on:
   workflow_dispatch:
