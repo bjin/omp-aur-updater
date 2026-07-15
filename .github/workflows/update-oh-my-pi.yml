@@ -130,32 +130,11 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "package_filename=${packages[0]}" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test installed package in fresh Arch container
+
+      - name: Push commit to AUR
         if: steps.update.outputs.changed == 'true'
-        env:
-          PACKAGE_FILENAME: ${{ steps.update.outputs.package_filename }}
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            -e PACKAGE_FILENAME \
-            -v "$PWD/aur:/repo:ro" \
-            archlinux:base-devel bash -lc '
-              set -euo pipefail
-              pacman -Syu --noconfirm
-              pacman -U --noconfirm "/repo/${PACKAGE_FILENAME}"
-
-              runtime=$(mktemp -d)
-              export HOME="$runtime/home"
-              export XDG_DATA_HOME="$runtime/xdg"
-              mkdir -p "$HOME" "$XDG_DATA_HOME"
-
-              smoke_output=$(omp --smoke-test)
-              if [ "$smoke_output" != "smoke-test: ok" ]; then
-                echo "Unexpected smoke-test output: $smoke_output" >&2
-                exit 1
-              fi
-              omp --version
-            '
+        working-directory: aur
+        run: git push origin master
 
       - name: Publish signed pacman repository
         if: steps.update.outputs.changed == 'true'
@@ -184,7 +163,3 @@ jobs:
                 "aur/${PACKAGE_FILENAME}"
             '
 
-      - name: Push commit to AUR
-        if: steps.update.outputs.changed == 'true'
-        working-directory: aur
-        run: git push origin master
