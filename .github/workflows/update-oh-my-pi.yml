@@ -53,12 +53,80 @@ jobs:
       - name: Clone AUR package
         run: git clone ssh://aur@aur.archlinux.org/oh-my-pi.git aur
 
-      - name: Record starting commit
-        id: base
+      - name: Check upstream version and update PKGBUILD
+        id: update
         working-directory: aur
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
 
-      - name: Run AUR update script
+          latest_ref=$(
+            git ls-remote --refs --tags --sort=-v:refname \
+              https://github.com/can1357/oh-my-pi.git 'v*.*.*' |
+              awk 'NR == 1 { print $2 }'
+          )
+          if [ -z "$latest_ref" ]; then
+            echo "Unable to find the latest upstream version tag." >&2
+            exit 1
+          fi
+
+          latest_version="${latest_ref##*/v}"
+          if [[ "$latest_version" != *.*.* ]]; then
+            echo "Invalid upstream version: $latest_version" >&2
+            exit 1
+          fi
+
+          current_version=$(awk -F= '/^pkgver=/{ print $2; exit }' PKGBUILD)
+          current_version="${current_version//[[:space:]]/}"
+          if [ -z "$current_version" ]; then
+            echo "Unable to read pkgver from PKGBUILD." >&2
+            exit 1
+          fi
+          if [[ "$current_version" != *.*.* ]]; then
+            echo "Invalid pkgver in PKGBUILD: $current_version" >&2
+            exit 1
+          fi
+
+          echo "version=$latest_version" >> "$GITHUB_OUTPUT"
+          if [ "$current_version" = "$latest_version" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $current_version"
+            exit 0
+          fi
+
+          pkgbuild_tmp=$(mktemp)
+          trap 'rm -f "$pkgbuild_tmp"' EXIT
+          if ! awk -v latest_version="$latest_version" '
+            BEGIN {
+              updated_pkgver = 0
+              updated_pkgrel = 0
+            }
+            /^pkgver=/ && !updated_pkgver {
+              print "pkgver=" latest_version
+              updated_pkgver = 1
+              next
+            }
+            /^pkgrel=/ && !updated_pkgrel {
+              print "pkgrel=1"
+              updated_pkgrel = 1
+              next
+            }
+            {
+              print
+            }
+            END {
+              exit((updated_pkgver && updated_pkgrel) ? 0 : 1)
+            }
+          ' PKGBUILD > "$pkgbuild_tmp"; then
+            echo "Unable to update pkgver and pkgrel in PKGBUILD." >&2
+            exit 1
+          fi
+          mv "$pkgbuild_tmp" PKGBUILD
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Updated: $current_version -> $latest_version"
+
+      - name: Build and smoke test package
+        if: steps.update.outputs.changed == 'true'
         working-directory: aur
         run: |
           set -euo pipefail
@@ -86,26 +154,28 @@ jobs:
             su "$builder" -s /usr/bin/bash <<'"'"'EOSU'"'"'
             set -euo pipefail
             cd /pkg
-            git config user.name "Bin Jin"
-            git config user.email "bjin@protonmail.com"
-            git config commit.gpgsign false
-            ./update.sh
+            makepkg
+            makepkg --printsrcinfo >.SRCINFO
+
+            runtime_dir=$(mktemp -d)
+            trap '"'"'rm -rf "$runtime_dir"'"'"' EXIT
+            smoke_output=$(
+              env HOME="${runtime_dir}/home" XDG_DATA_HOME="${runtime_dir}/xdg" \
+                pkg/oh-my-pi/usr/bin/omp --smoke-test
+            )
+            if [ "$smoke_output" != "smoke-test: ok" ]; then
+              echo "Unexpected omp --smoke-test output: $smoke_output" >&2
+              exit 1
+            fi
           EOSU
           '
 
-      - name: Detect generated commit and package
-        id: update
+      - name: Record built package
+        if: steps.update.outputs.changed == 'true'
+        id: package
         working-directory: aur
-        env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           set -euo pipefail
-          if [ "$(git rev-parse HEAD)" = "$BASE_SHA" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No AUR update generated."
-            exit 0
-          fi
-
           shopt -s nullglob
           packages=( *.pkg.tar.* )
           if [ "${#packages[@]}" -ne 1 ]; then
@@ -113,22 +183,34 @@ jobs:
             printf '  %s\n' "${packages[@]}" >&2
             exit 1
           fi
+          echo "filename=${packages[0]}" >> "$GITHUB_OUTPUT"
 
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "package_filename=${packages[0]}" >> "$GITHUB_OUTPUT"
-
-
-      - name: Push commit to AUR
+      - name: Commit and push to AUR
         if: steps.update.outputs.changed == 'true'
         working-directory: aur
-        run: git push origin master
+        env:
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "Bin Jin"
+          git config user.email "bjin@protonmail.com"
+          git config commit.gpgsign false
+          git add PKGBUILD .SRCINFO
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No package metadata changes to commit." >&2
+            exit 1
+          fi
+          git --no-pager diff --cached
+          git commit -m "upstream release: ${VERSION}"
+          git push origin master
 
       - name: Publish signed pacman repository
         if: steps.update.outputs.changed == 'true'
         env:
           ARCH_REPO_GPG_PRIVATE_KEY: ${{ secrets.ARCH_REPO_GPG_PRIVATE_KEY }}
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_FILENAME: ${{ steps.update.outputs.package_filename }}
+          PACKAGE_FILENAME: ${{ steps.package.outputs.filename }}
         run: |
           set -euo pipefail
           docker run --rm \
