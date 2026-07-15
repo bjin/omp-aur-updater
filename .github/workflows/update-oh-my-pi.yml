@@ -87,9 +87,18 @@ jobs:
           fi
 
           echo "version=$latest_version" >> "$GITHUB_OUTPUT"
-          if [ "$current_version" = "$latest_version" ]; then
+          current_is_current_or_newer=$(
+            python3 - "$current_version" "$latest_version" <<'PY'
+          import sys
+
+          current = tuple(int(part) for part in sys.argv[1].split("."))
+          latest = tuple(int(part) for part in sys.argv[2].split("."))
+          print("true" if current >= latest else "false")
+          PY
+          )
+          if [ "$current_is_current_or_newer" = true ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already up to date: $current_version"
+            echo "No update needed: current package $current_version, latest upstream $latest_version"
             exit 0
           fi
 
