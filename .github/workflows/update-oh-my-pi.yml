@@ -7,7 +7,7 @@ on:
       - oh-my-pi-nix-master
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: update-aur-oh-my-pi
@@ -20,6 +20,9 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Show trigger context
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -103,15 +106,85 @@ jobs:
           EOSU
           '
 
-      - name: Push commit to AUR
+      - name: Detect generated commit and package
+        id: update
         working-directory: aur
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           set -euo pipefail
           if [ "$(git rev-parse HEAD)" = "$BASE_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No AUR update generated."
             exit 0
           fi
 
-          git push origin master
+          shopt -s nullglob
+          packages=( *.pkg.tar.* )
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected one built package, found ${#packages[@]}." >&2
+            printf '  %s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "package_filename=${packages[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test installed package in fresh Arch container
+        if: steps.update.outputs.changed == 'true'
+        env:
+          PACKAGE_FILENAME: ${{ steps.update.outputs.package_filename }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e PACKAGE_FILENAME \
+            -v "$PWD/aur:/repo:ro" \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm
+              pacman -U --noconfirm "/repo/${PACKAGE_FILENAME}"
+
+              runtime=$(mktemp -d)
+              export HOME="$runtime/home"
+              export XDG_DATA_HOME="$runtime/xdg"
+              mkdir -p "$HOME" "$XDG_DATA_HOME"
+
+              smoke_output=$(omp --smoke-test)
+              if [ "$smoke_output" != "smoke-test: ok" ]; then
+                echo "Unexpected smoke-test output: $smoke_output" >&2
+                exit 1
+              fi
+              omp --version
+            '
+
+      - name: Publish signed pacman repository
+        if: steps.update.outputs.changed == 'true'
+        env:
+          ARCH_REPO_GPG_PRIVATE_KEY: ${{ secrets.ARCH_REPO_GPG_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_FILENAME: ${{ steps.update.outputs.package_filename }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e ARCH_REPO_GPG_PRIVATE_KEY \
+            -e GH_TOKEN \
+            -e GITHUB_REPOSITORY \
+            -e PACKAGE_FILENAME \
+            -v "$PWD:/work" \
+            -w /work \
+            archlinux:base-devel bash -lc '
+              set -euo pipefail
+              pacman -Syu --noconfirm --needed gnupg python
+              python3 scripts/publish_arch_repo.py \
+                --release oh-my-pi \
+                --repo-name oh-my-pi \
+                --key-fingerprint F35777CFE7F0794D92338EA52FABE6F52B586BAB \
+                --keep-newest 5 \
+                --minimum-age-days 7 \
+                "aur/${PACKAGE_FILENAME}"
+            '
+
+      - name: Push commit to AUR
+        if: steps.update.outputs.changed == 'true'
+        working-directory: aur
+        run: git push origin master
