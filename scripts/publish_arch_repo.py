@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,12 +23,48 @@ from typing import Any
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 PACKAGE_RE = re.compile(r"\.pkg\.tar(?:\.[A-Za-z0-9]+)+$")
+MAX_UPLOAD_ATTEMPTS = 4
+MAX_UPLOAD_BACKOFF_SECONDS = 60
+TRANSIENT_UPLOAD_STATUSES = frozenset({500, 502, 503, 504})
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(
+        self, status: int, message: str, headers: dict[str, str] | None = None
+    ) -> None:
         super().__init__(f"GitHub API returned HTTP {status}: {message}")
         self.status = status
+        self.message = message
+        self.headers = headers or {}
+
+
+def is_rate_limited(error: GitHubError) -> bool:
+    if error.status == 429:
+        return True
+    if error.status != 403:
+        return False
+    return (
+        "retry-after" in error.headers
+        or error.headers.get("x-ratelimit-remaining") == "0"
+        or "rate limit" in error.message.lower()
+    )
+
+
+def is_retryable_upload_error(error: GitHubError) -> bool:
+    return error.status in TRANSIENT_UPLOAD_STATUSES or is_rate_limited(error)
+
+
+def upload_retry_delay(error: GitHubError, attempt: int) -> int:
+    retry_after = error.headers.get("retry-after")
+    if retry_after and retry_after.isdigit():
+        return max(1, int(retry_after))
+
+    if error.headers.get("x-ratelimit-remaining") == "0":
+        reset = error.headers.get("x-ratelimit-reset")
+        if reset and reset.isdigit():
+            return max(1, int(reset) - int(time.time()) + 5)
+
+    return min(MAX_UPLOAD_BACKOFF_SECONDS, 2**attempt)
 
 
 class GitHubRelease:
@@ -154,6 +191,21 @@ class GitHubRelease:
                 return assets
             page += 1
 
+    def _find_asset_with_size(
+        self, release_id: int, name: str, expected_size: int
+    ) -> dict[str, Any] | None:
+        for asset in self.list_assets(release_id):
+            if asset["name"] != name:
+                continue
+            if asset["size"] != expected_size:
+                raise RuntimeError(
+                    f"Release asset {name} exists with size {asset['size']}, "
+                    f"expected {expected_size}"
+                )
+            return asset
+        return None
+
+
     def download_asset(self, asset: dict[str, Any], destination: Path) -> None:
         request = urllib.request.Request(
             asset["url"],
@@ -173,32 +225,85 @@ class GitHubRelease:
         self.request("DELETE", f"/repos/{self.repository}/releases/assets/{asset['id']}")
 
     def upload_asset(self, release_id: int, source: Path, name: str) -> dict[str, Any]:
+        source_size = source.stat().st_size
         query = urllib.parse.urlencode({"name": name})
         target = (
             f"/repos/{self.owner}/{self.name}/releases/{release_id}/assets?{query}"
         )
-        connection = http.client.HTTPSConnection("uploads.github.com", timeout=600)
-        connection.putrequest("POST", target)
-        for header, value in self._headers().items():
-            connection.putheader(header, value)
-        connection.putheader("Content-Type", "application/octet-stream")
-        connection.putheader("Content-Length", str(source.stat().st_size))
-        connection.endheaders()
-        with source.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                connection.send(chunk)
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        if response.status != 201:
+        upload_may_have_succeeded = False
+
+        def confirm_ambiguous_upload() -> dict[str, Any] | None:
+            try:
+                return self._find_asset_with_size(release_id, name, source_size)
+            except GitHubError as error:
+                print(
+                    f"Could not verify release asset {name} after a transient upload "
+                    f"failure: {error}",
+                    file=sys.stderr,
+                )
+                return None
+
+        for attempt in range(MAX_UPLOAD_ATTEMPTS):
+            if upload_may_have_succeeded:
+                uploaded = confirm_ambiguous_upload()
+                if uploaded is not None:
+                    print(f"Release asset {name} exists after a transient upload failure")
+                    return uploaded
+
+            connection = http.client.HTTPSConnection("uploads.github.com", timeout=600)
+            try:
+                connection.putrequest("POST", target)
+                for header, value in self._headers().items():
+                    connection.putheader(header, value)
+                connection.putheader("Content-Type", "application/octet-stream")
+                connection.putheader("Content-Length", str(source_size))
+                connection.endheaders()
+                with source.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        connection.send(chunk)
+                response = connection.getresponse()
+                body = response.read()
+                response_headers = {
+                    header.lower(): value for header, value in response.getheaders()
+                }
+            finally:
+                connection.close()
+
+            if response.status == 201:
+                print(f"Uploaded release asset {name}")
+                return json.loads(body)
+
             message = body.decode("utf-8", errors="replace")
             try:
                 message = json.loads(message).get("message", message)
             except json.JSONDecodeError:
                 pass
-            raise GitHubError(response.status, str(message))
-        print(f"Uploaded release asset {name}")
-        return json.loads(body)
+            error = GitHubError(response.status, str(message), response_headers)
+            if error.status == 422 and upload_may_have_succeeded:
+                uploaded = confirm_ambiguous_upload()
+                if uploaded is not None:
+                    print(f"Release asset {name} exists after a transient upload failure")
+                    return uploaded
+            if not is_retryable_upload_error(error):
+                raise error
+
+            upload_may_have_succeeded = True
+            if attempt == MAX_UPLOAD_ATTEMPTS - 1:
+                uploaded = confirm_ambiguous_upload()
+                if uploaded is not None:
+                    print(f"Release asset {name} exists after a transient upload failure")
+                    return uploaded
+                raise error
+
+            delay = upload_retry_delay(error, attempt)
+            print(
+                f"GitHub upload of {name} returned HTTP {error.status}; retrying in "
+                f"{delay}s ({attempt + 2}/{MAX_UPLOAD_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+        raise AssertionError("unreachable")
 
     def replace_asset(
         self,
