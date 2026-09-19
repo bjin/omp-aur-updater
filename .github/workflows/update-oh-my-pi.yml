@@ -181,12 +181,85 @@ jobs:
             exit 0
           fi
 
+          lockfile=$(mktemp)
           pkgbuild_tmp=$(mktemp)
-          trap 'rm -f "$pkgbuild_tmp"' EXIT
-          if ! awk -v latest_version="$latest_version" '
+          trap 'rm -f "$lockfile" "$pkgbuild_tmp"' EXIT
+
+          # PKGBUILD pins the `opus` crate so prepare() can patch a copy of it
+          # into linking the system libopus, and pins the checksum Cargo.lock
+          # records for that crate. Both have to follow the upstream lockfile.
+          if ! curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+              "https://raw.githubusercontent.com/can1357/oh-my-pi/v${latest_version}/Cargo.lock" \
+              -o "$lockfile"; then
+            echo "Unable to download Cargo.lock for v${latest_version}." >&2
+            exit 1
+          fi
+
+          opus_metadata=$(
+            python3 - "$lockfile" <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          lock = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          packages = [
+              package
+              for package in lock.get("package", [])
+              if package.get("name") == "opus"
+          ]
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Expected one opus package in Cargo.lock, found {len(packages)}"
+              )
+
+          version = packages[0].get("version")
+          checksum = packages[0].get("checksum")
+          if not version or not checksum:
+              raise SystemExit("Cargo.lock opus entry has no version or checksum")
+          print(version, checksum)
+          PY
+          )
+          read -r opus_version opus_checksum <<<"$opus_metadata"
+          if [[ ! "$opus_version" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            echo "Invalid opus version in Cargo.lock: $opus_version" >&2
+            exit 1
+          fi
+          if [[ ! "$opus_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid opus checksum in Cargo.lock: $opus_checksum" >&2
+            exit 1
+          fi
+
+          # The crate's sha256sums entry is positional, so read the current pin
+          # back through the PKGBUILD's own arrays instead of guessing an index.
+          opus_pin=$(
+            set -euo pipefail
+            # shellcheck source=/dev/null
+            . ./PKGBUILD
+            for index in "${!source[@]}"; do
+              if [[ "${source[index]}" == */opus-"${_opus_ver}".crate ]]; then
+                printf '%s %s\n' "$_opus_ver" "${sha256sums[index]}"
+                exit 0
+              fi
+            done
+            echo "Unable to locate the opus crate in the PKGBUILD source array." >&2
+            exit 1
+          )
+          read -r current_opus_version current_opus_checksum <<<"$opus_pin"
+          if [[ ! "$current_opus_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid opus checksum in PKGBUILD: $current_opus_checksum" >&2
+            exit 1
+          fi
+
+          if ! awk -v latest_version="$latest_version" \
+            -v current_opus_version="$current_opus_version" \
+            -v opus_version="$opus_version" \
+            -v current_opus_checksum="$current_opus_checksum" \
+            -v opus_checksum="$opus_checksum" '
             BEGIN {
               updated_pkgver = 0
               updated_pkgrel = 0
+              updated_opus_ver = 0
+              updated_opus_checksum = 0
             }
             /^pkgver=/ && !updated_pkgver {
               print "pkgver=" latest_version
@@ -198,14 +271,28 @@ jobs:
               updated_pkgrel = 1
               next
             }
+            $0 == "_opus_ver=" current_opus_version && !updated_opus_ver {
+              print "_opus_ver=" opus_version
+              updated_opus_ver = 1
+              next
+            }
+            !updated_opus_checksum {
+              position = index($0, current_opus_checksum)
+              if (position > 0) {
+                print substr($0, 1, position - 1) opus_checksum \
+                  substr($0, position + length(current_opus_checksum))
+                updated_opus_checksum = 1
+                next
+              }
+            }
             {
               print
             }
             END {
-              exit((updated_pkgver && updated_pkgrel) ? 0 : 1)
+              exit((updated_pkgver && updated_pkgrel && updated_opus_ver && updated_opus_checksum) ? 0 : 1)
             }
           ' PKGBUILD > "$pkgbuild_tmp"; then
-            echo "Unable to update pkgver and pkgrel in PKGBUILD." >&2
+            echo "Unable to update pkgver, pkgrel, and the opus pin in PKGBUILD." >&2
             exit 1
           fi
           mv "$pkgbuild_tmp" PKGBUILD
@@ -214,6 +301,10 @@ jobs:
           echo "build=true" >> "$GITHUB_OUTPUT"
           echo "bump=true" >> "$GITHUB_OUTPUT"
           echo "Updated: $current_version -> $latest_version"
+          if [ "$current_opus_version" != "$opus_version" ] ||
+             [ "$current_opus_checksum" != "$opus_checksum" ]; then
+            echo "Updated opus pin: $current_opus_version -> $opus_version"
+          fi
 
       - name: Build and smoke test package
         if: steps.update.outputs.build == 'true'
