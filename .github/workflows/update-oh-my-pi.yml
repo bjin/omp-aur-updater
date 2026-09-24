@@ -148,19 +148,10 @@ jobs:
             exit 1
           fi
 
-          latest_ref=$(
-            git ls-remote --refs --tags --sort=-v:refname \
-              https://github.com/can1357/oh-my-pi.git 'v*.*.*' |
-              awk 'NR == 1 { print $2 }'
-          )
-          if [ -z "$latest_ref" ]; then
-            echo "Unable to find the latest upstream version tag." >&2
-            exit 1
-          fi
-
-          latest_version="${latest_ref##*/v}"
-          if [[ "$latest_version" != *.*.* ]]; then
-            echo "Invalid upstream version: $latest_version" >&2
+          latest_tag=$(gh api repos/can1357/oh-my-pi/releases/latest --jq .tag_name)
+          latest_version="${latest_tag#v}"
+          if [[ "$latest_tag" != v* || "$latest_version" != *.*.* ]]; then
+            echo "Unexpected latest upstream release tag: $latest_tag" >&2
             exit 1
           fi
 
@@ -181,17 +172,25 @@ jobs:
             exit 0
           fi
 
-          lockfile=$(mktemp)
-          pkgbuild_tmp=$(mktemp)
-          trap 'rm -f "$lockfile" "$pkgbuild_tmp"' EXIT
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir" "$release_response" "$release_error"' EXIT
+          tarball="$work_dir/oh-my-pi-${latest_version}.tar.gz"
+          lockfile="$work_dir/Cargo.lock"
+          pkgbuild_tmp="$work_dir/PKGBUILD"
 
-          # PKGBUILD pins the `opus` crate so prepare() can patch a copy of it
-          # into linking the system libopus, and pins the checksum Cargo.lock
-          # records for that crate. Both have to follow the upstream lockfile.
+          # PKGBUILD pins the release tarball checksum. It also pins the `opus`
+          # crate so prepare() can patch a copy of it into linking the system
+          # libopus, and pins the checksum Cargo.lock records for that crate;
+          # both have to follow the lockfile shipped in the tarball.
           if ! curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
-              "https://raw.githubusercontent.com/can1357/oh-my-pi/v${latest_version}/Cargo.lock" \
-              -o "$lockfile"; then
-            echo "Unable to download Cargo.lock for v${latest_version}." >&2
+              "https://github.com/can1357/oh-my-pi/archive/v${latest_version}.tar.gz" \
+              -o "$tarball"; then
+            echo "Unable to download the v${latest_version} source tarball." >&2
+            exit 1
+          fi
+          tarball_checksum=$(sha256sum "$tarball" | cut -d ' ' -f 1)
+          if ! tar -xzOf "$tarball" "oh-my-pi-${latest_version}/Cargo.lock" > "$lockfile"; then
+            echo "Unable to extract Cargo.lock from the v${latest_version} source tarball." >&2
             exit 1
           fi
 
@@ -229,36 +228,56 @@ jobs:
             exit 1
           fi
 
-          # The crate's sha256sums entry is positional, so read the current pin
-          # back through the PKGBUILD's own arrays instead of guessing an index.
-          opus_pin=$(
+          # sha256sums entries are positional, so read the current pins back
+          # through the PKGBUILD's own arrays instead of guessing indices.
+          pins=$(
             set -euo pipefail
             # shellcheck source=/dev/null
             . ./PKGBUILD
+            tarball_pin=
+            opus_pin=
             for index in "${!source[@]}"; do
-              if [[ "${source[index]}" == */opus-"${_opus_ver}".crate ]]; then
-                printf '%s %s\n' "$_opus_ver" "${sha256sums[index]}"
-                exit 0
-              fi
+              case "${source[index]}" in
+                "${pkgname}-${pkgver}.tar.gz::"*) tarball_pin="${sha256sums[index]}" ;;
+                */opus-"${_opus_ver}".crate) opus_pin="${sha256sums[index]}" ;;
+              esac
             done
-            echo "Unable to locate the opus crate in the PKGBUILD source array." >&2
-            exit 1
+            if [ -z "$tarball_pin" ] || [ -z "$opus_pin" ]; then
+              echo "Unable to locate the source tarball and opus crate in the PKGBUILD source array." >&2
+              exit 1
+            fi
+            printf '%s %s %s\n' "$tarball_pin" "$_opus_ver" "$opus_pin"
           )
-          read -r current_opus_version current_opus_checksum <<<"$opus_pin"
+          read -r current_tarball_checksum current_opus_version current_opus_checksum <<<"$pins"
+          if [[ ! "$current_tarball_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid source tarball checksum in PKGBUILD: $current_tarball_checksum" >&2
+            exit 1
+          fi
           if [[ ! "$current_opus_checksum" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Invalid opus checksum in PKGBUILD: $current_opus_checksum" >&2
             exit 1
           fi
 
           if ! awk -v latest_version="$latest_version" \
+            -v current_tarball_checksum="$current_tarball_checksum" \
+            -v tarball_checksum="$tarball_checksum" \
             -v current_opus_version="$current_opus_version" \
             -v opus_version="$opus_version" \
             -v current_opus_checksum="$current_opus_checksum" \
             -v opus_checksum="$opus_checksum" '
+            function replace_once(old, new,    position) {
+              position = index($0, old)
+              if (position == 0) {
+                return 0
+              }
+              $0 = substr($0, 1, position - 1) new substr($0, position + length(old))
+              return 1
+            }
             BEGIN {
               updated_pkgver = 0
               updated_pkgrel = 0
               updated_opus_ver = 0
+              updated_tarball_checksum = 0
               updated_opus_checksum = 0
             }
             /^pkgver=/ && !updated_pkgver {
@@ -276,23 +295,20 @@ jobs:
               updated_opus_ver = 1
               next
             }
-            !updated_opus_checksum {
-              position = index($0, current_opus_checksum)
-              if (position > 0) {
-                print substr($0, 1, position - 1) opus_checksum \
-                  substr($0, position + length(current_opus_checksum))
-                updated_opus_checksum = 1
-                next
-              }
+            !updated_tarball_checksum && replace_once(current_tarball_checksum, tarball_checksum) {
+              updated_tarball_checksum = 1
+            }
+            !updated_opus_checksum && replace_once(current_opus_checksum, opus_checksum) {
+              updated_opus_checksum = 1
             }
             {
               print
             }
             END {
-              exit((updated_pkgver && updated_pkgrel && updated_opus_ver && updated_opus_checksum) ? 0 : 1)
+              exit((updated_pkgver && updated_pkgrel && updated_opus_ver && updated_tarball_checksum && updated_opus_checksum) ? 0 : 1)
             }
           ' PKGBUILD > "$pkgbuild_tmp"; then
-            echo "Unable to update pkgver, pkgrel, and the opus pin in PKGBUILD." >&2
+            echo "Unable to update pkgver, pkgrel, the source tarball checksum, and the opus pin in PKGBUILD." >&2
             exit 1
           fi
           mv "$pkgbuild_tmp" PKGBUILD
