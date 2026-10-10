@@ -1,6 +1,6 @@
 # oh-my-pi AUR updater and pacman repository
 
-This repository updates both the [`oh-my-pi`](https://aur.archlinux.org/packages/oh-my-pi) and [`oh-my-pi-bin`](https://aur.archlinux.org/packages/oh-my-pi-bin) AUR packages. Newly built `oh-my-pi` packages are also published as a signed pacman repository in the fixed GitHub Release [`oh-my-pi`](https://github.com/bjin/omp-aur-updater/releases/tag/oh-my-pi).
+This repository updates the [`oh-my-pi`](https://aur.archlinux.org/packages/oh-my-pi), [`oh-my-pi-bin`](https://aur.archlinux.org/packages/oh-my-pi-bin), and optional [`oh-my-pi-grammars-bin`](https://aur.archlinux.org/packages/oh-my-pi-grammars-bin) AUR packages. Newly built `oh-my-pi` packages are also published as a signed pacman repository in the fixed GitHub Release [`oh-my-pi`](https://github.com/bjin/omp-aur-updater/releases/tag/oh-my-pi).
 
 The release contains:
 

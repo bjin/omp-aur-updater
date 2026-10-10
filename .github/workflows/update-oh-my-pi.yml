@@ -137,45 +137,47 @@ jobs:
           fi
 
           if [ "$package_published" = false ]; then
-            echo "version=$current_version" >> "$GITHUB_OUTPUT"
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "bump=false" >> "$GITHUB_OUTPUT"
+            latest_version="$current_version"
+            bump=false
             echo "Building current package: $package_asset is not published."
-            exit 0
-          fi
-          if [ "$package_published" != true ]; then
-            echo "Unexpected publication status: $package_published" >&2
-            exit 1
-          fi
+          elif [ "$package_published" = true ]; then
+            latest_tag=$(gh api repos/can1357/oh-my-pi/releases/latest --jq .tag_name)
+            latest_version="${latest_tag#v}"
+            if [[ "$latest_tag" != v* || "$latest_version" != *.*.* ]]; then
+              echo "Unexpected latest upstream release tag: $latest_tag" >&2
+              exit 1
+            fi
 
-          latest_tag=$(gh api repos/can1357/oh-my-pi/releases/latest --jq .tag_name)
-          latest_version="${latest_tag#v}"
-          if [[ "$latest_tag" != v* || "$latest_version" != *.*.* ]]; then
-            echo "Unexpected latest upstream release tag: $latest_tag" >&2
-            exit 1
-          fi
-
-          current_is_current_or_newer=$(
-            python3 - "$current_version" "$latest_version" <<'PY'
+            current_is_current_or_newer=$(
+              python3 - "$current_version" "$latest_version" <<'PY'
           import sys
 
           current = tuple(int(part) for part in sys.argv[1].split("."))
           latest = tuple(int(part) for part in sys.argv[2].split("."))
           print("true" if current >= latest else "false")
           PY
-          )
-          if [ "$current_is_current_or_newer" = true ]; then
-            echo "version=$current_version" >> "$GITHUB_OUTPUT"
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "bump=false" >> "$GITHUB_OUTPUT"
-            echo "No update needed: current package $current_version-$current_pkgrel is published."
-            exit 0
+            )
+            if [ "$current_is_current_or_newer" = true ]; then
+              {
+                echo "version=$current_version"
+                echo "build=false"
+                echo "bump=false"
+                echo "grammar_changed=false"
+              } >> "$GITHUB_OUTPUT"
+              echo "No update needed: current package $current_version-$current_pkgrel is published."
+              exit 0
+            fi
+            bump=true
+          else
+            echo "Unexpected publication status: $package_published" >&2
+            exit 1
           fi
 
           work_dir=$(mktemp -d)
           trap 'rm -rf "$work_dir" "$release_response" "$release_error"' EXIT
           tarball="$work_dir/oh-my-pi-${latest_version}.tar.gz"
           lockfile="$work_dir/Cargo.lock"
+          grammar_file="$work_dir/wasm_grammars.rs"
           pkgbuild_tmp="$work_dir/PKGBUILD"
 
           # PKGBUILD pins the release tarball checksum. It also pins the `opus`
@@ -192,6 +194,25 @@ jobs:
           if ! tar -xzOf "$tarball" "oh-my-pi-${latest_version}/Cargo.lock" > "$lockfile"; then
             echo "Unable to extract Cargo.lock from the v${latest_version} source tarball." >&2
             exit 1
+          fi
+          if ! tar -xzOf "$tarball" \
+              "oh-my-pi-${latest_version}/crates/pi-ast/src/language/wasm_grammars.rs" \
+              > "$grammar_file"; then
+            echo "Unable to extract wasm_grammars.rs from the v${latest_version} source tarball." >&2
+            exit 1
+          fi
+          grammar_metadata=$(
+            python3 "$GITHUB_WORKSPACE/scripts/update_grammar_release.py" "$grammar_file" PKGBUILD
+          )
+          read -r grammar_version grammar_changed <<<"$grammar_metadata"
+          if [ "$bump" = true ]; then
+            latest_pkgrel=1
+          elif [ "$grammar_changed" = true ]; then
+            # A corrected pin for the same upstream release needs a new pkgrel.
+            latest_pkgrel=$(( ${current_pkgrel%%.*} + 1 ))
+            bump=true
+          else
+            latest_pkgrel="$current_pkgrel"
           fi
 
           opus_metadata=$(
@@ -259,6 +280,7 @@ jobs:
           fi
 
           if ! awk -v latest_version="$latest_version" \
+            -v latest_pkgrel="$latest_pkgrel" \
             -v current_tarball_checksum="$current_tarball_checksum" \
             -v tarball_checksum="$tarball_checksum" \
             -v current_opus_version="$current_opus_version" \
@@ -286,7 +308,7 @@ jobs:
               next
             }
             /^pkgrel=/ && !updated_pkgrel {
-              print "pkgrel=1"
+              print "pkgrel=" latest_pkgrel
               updated_pkgrel = 1
               next
             }
@@ -313,10 +335,17 @@ jobs:
           fi
           mv "$pkgbuild_tmp" PKGBUILD
 
-          echo "version=$latest_version" >> "$GITHUB_OUTPUT"
-          echo "build=true" >> "$GITHUB_OUTPUT"
-          echo "bump=true" >> "$GITHUB_OUTPUT"
-          echo "Updated: $current_version -> $latest_version"
+          {
+            echo "version=$latest_version"
+            echo "build=true"
+            echo "bump=$bump"
+            echo "grammar_version=$grammar_version"
+            echo "grammar_changed=$grammar_changed"
+          } >> "$GITHUB_OUTPUT"
+          echo "Planned: $current_version-$current_pkgrel -> $latest_version-$latest_pkgrel"
+          if [ "$grammar_changed" = true ]; then
+            echo "Updated grammar pin to $grammar_version"
+          fi
           if [ "$current_opus_version" != "$opus_version" ] ||
              [ "$current_opus_checksum" != "$opus_checksum" ]; then
             echo "Updated opus pin: $current_opus_version -> $opus_version"
@@ -388,6 +417,94 @@ jobs:
             exit 1
           fi
           echo "filename=${packages[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Update, build, and push grammar AUR package
+        if: steps.update.outputs.grammar_changed == 'true'
+        env:
+          GRAMMAR_VERSION: ${{ steps.update.outputs.grammar_version }}
+        run: |
+          set -euo pipefail
+          mkdir aur-grammars
+          # Only the grammar checkout is shared; no SSH or signing keys enter the build.
+          docker run --rm -i \
+            -e GRAMMAR_VERSION \
+            -v "$PWD/aur-grammars:/pkg" \
+            archlinux:base-devel bash -s <<'ARCH'
+          set -euo pipefail
+          pacman -Syu --needed --noconfirm git pacman-contrib
+
+          host_uid=$(stat -c %u /pkg)
+          host_gid=$(stat -c %g /pkg)
+          if ! getent group "$host_gid" >/dev/null; then
+            groupadd -g "$host_gid" builder
+          fi
+          if getent passwd "$host_uid" >/dev/null; then
+            builder=$(getent passwd "$host_uid" | cut -d: -f1)
+          else
+            useradd -m -u "$host_uid" -g "$host_gid" builder
+            builder=builder
+          fi
+          builder_home=$(getent passwd "$builder" | cut -d: -f6)
+          install -d -o "$host_uid" -g "$host_gid" "$builder_home"
+          printf "%s ALL=(root) NOPASSWD: /usr/bin/pacman\n" "$builder" \
+            > /etc/sudoers.d/makepkg-syncdeps
+          chmod 440 /etc/sudoers.d/makepkg-syncdeps
+          visudo -cqf /etc/sudoers.d/makepkg-syncdeps
+
+          su "$builder" -s /usr/bin/bash <<'EOSU'
+          set -euo pipefail
+          git clone https://aur.archlinux.org/oh-my-pi-grammars-bin.git /pkg
+          cd /pkg
+          current_version=$(
+            # shellcheck source=/dev/null
+            . ./PKGBUILD
+            printf '%s' "$pkgver"
+          )
+          if (( $(vercmp "$GRAMMAR_VERSION" "$current_version") <= 0 )); then
+            echo "No grammar upgrade needed: AUR $current_version, requested $GRAMMAR_VERSION."
+            exit 0
+          fi
+
+          pkgbuild_tmp=$(mktemp)
+          if ! awk -v version="$GRAMMAR_VERSION" '
+            /^_grammar_release=/ {
+              print "_grammar_release=\"" version "\""
+              release_count++
+              next
+            }
+            /^pkgrel=/ {
+              print "pkgrel=1"
+              pkgrel_count++
+              next
+            }
+            { print }
+            END { exit((release_count == 1 && pkgrel_count == 1) ? 0 : 1) }
+          ' PKGBUILD > "$pkgbuild_tmp"; then
+            echo "Unable to update the grammar release and pkgrel in PKGBUILD." >&2
+            exit 1
+          fi
+          cat "$pkgbuild_tmp" > PKGBUILD
+          rm "$pkgbuild_tmp"
+          updpkgsums
+          makepkg --syncdeps --noconfirm
+          makepkg --printsrcinfo > .SRCINFO
+          EOSU
+          ARCH
+
+          cd aur-grammars
+          git config user.name "Bin Jin"
+          git config user.email "bjin@protonmail.com"
+          git config commit.gpgsign false
+          git add PKGBUILD .SRCINFO
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No grammar package metadata changes to commit."
+            exit 0
+          fi
+          git --no-pager diff --cached
+          git commit -m "upstream release: ${GRAMMAR_VERSION}"
+          git remote set-url --push origin ssh://aur@aur.archlinux.org/oh-my-pi-grammars-bin.git
+          git push origin master
 
       - name: Commit and push to AUR
         if: steps.update.outputs.bump == 'true'
