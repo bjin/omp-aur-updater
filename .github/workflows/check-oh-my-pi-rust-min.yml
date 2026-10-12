@@ -1,0 +1,125 @@
+name: Check oh-my-pi minimum Rust version
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-oh-my-pi-rust-min
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Build baseline pi_natives with _rust_min
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_HOME: ${{ github.workspace }}/cargo-home
+      RUSTUP_HOME: /opt/rustup
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --needed --noconfirm git rustup
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch current AUR package and install its minimum Rust
+        id: package
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://aur.archlinux.org/oh-my-pi.git aur
+          cd aur
+          # shellcheck source=/dev/null
+          source ./PKGBUILD
+          if [[ ! "$_rust_min" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid _rust_min in AUR PKGBUILD: $_rust_min" >&2
+            exit 1
+          fi
+          if [[ "$pkgname" != oh-my-pi || ! "$pkgver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected AUR package: $pkgname $pkgver" >&2
+            exit 1
+          fi
+          printf 'workspace=aur/src/%s-%s\n' "$pkgname" "$pkgver" >> "$GITHUB_OUTPUT"
+          printf 'rust=%s\n' "$_rust_min" >> "$GITHUB_OUTPUT"
+
+          # rustup provides cargo, so makepkg's dependencies do not pull in Arch Rust.
+          pacman -S --needed --noconfirm "${depends[@]}" "${makedepends[@]}"
+          rustup toolchain install "$_rust_min" --profile minimal --no-self-update
+          toolchain_bin=$(dirname "$(rustup which --toolchain "$_rust_min" rustc)")
+          # Use actual binaries: prepare() assigns RUSTUP_TOOLCHAIN=stable,
+          # which must not redirect rustup's proxies to a newer compiler.
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          {
+            echo "RUSTUP_TOOLCHAIN=$_rust_min"
+            echo "RUSTC=$toolchain_bin/rustc"
+            echo "RUSTDOC=$toolchain_bin/rustdoc"
+          } >> "$GITHUB_ENV"
+
+          # Keep compiled artifacts separate across native environments/recipes,
+          # but not across pkgver bumps, dates, or workflow run IDs.
+          native_environment=$(
+            {
+              pacman -Q
+              declare -f prepare _build_native
+              declare -p _cargo_features _variants
+              sha256sum ./*.patch "$GITHUB_WORKSPACE/scripts/build_rust_min.sh"
+            } | sha256sum | cut -d ' ' -f 1
+          )
+          echo "NATIVE_BUILD_ENV=$native_environment" >> "$GITHUB_ENV"
+          useradd --create-home builder
+          mkdir -p "$CARGO_HOME" "$GITHUB_WORKSPACE/cargo-target"
+          chown -R builder:builder "$GITHUB_WORKSPACE/aur" "$CARGO_HOME" "$GITHUB_WORKSPACE/cargo-target"
+
+      - name: Verify and extract package sources
+        run: |
+          set -euo pipefail
+          # Do not fetch Cargo dependencies until after restoring the cache.
+          su builder -s /usr/bin/bash <<'EOSU'
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/aur"
+          makepkg --nobuild --noprepare --noconfirm
+          EOSU
+
+      - name: Cache Cargo dependencies and baseline artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: oh-my-pi-rust-min-v1-${{ steps.package.outputs.rust }}
+          # The cache path stays fixed even when the extracted release changes.
+          workspaces: ${{ steps.package.outputs.workspace }} -> ../../../cargo-target
+          env-vars: NATIVE_BUILD_ENV
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+          cache-on-failure: "false"
+
+      - name: Build baseline addon with the pinned compiler
+        run: |
+          set -euo pipefail
+          # Restored archives may be owned by the action's root user.
+          chown -R builder:builder "$CARGO_HOME" "$GITHUB_WORKSPACE/cargo-target"
+          su builder -s /usr/bin/bash <<'EOSU'
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/build_rust_min.sh" "$GITHUB_WORKSPACE/aur" "$GITHUB_WORKSPACE/cargo-target"
+          EOSU
+          {
+            echo '### Minimum Rust verification passed'
+            echo
+            printf 'Built baseline pi_natives with Rust %s from the current AUR PKGBUILD.\n' "$RUSTUP_TOOLCHAIN"
+            echo
+            echo 'Cache candidates before dependency-only cleanup:'
+            echo '```'
+            du -sh "$CARGO_HOME" "$GITHUB_WORKSPACE/cargo-target"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
