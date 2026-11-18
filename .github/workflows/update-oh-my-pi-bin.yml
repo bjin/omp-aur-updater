@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.update.outputs.changed }}
-      version: ${{ steps.update.outputs.version }}
+      message: ${{ steps.update.outputs.message }}
     steps:
       - name: Install SSH key
         env:
@@ -64,69 +64,39 @@ jobs:
         id: update
         working-directory: aur
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 <<'PY'
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir"' EXIT
+
+          gh api repos/can1357/oh-my-pi/releases/latest > "$work_dir/release.json"
+          latest_tag=$(jq -r .tag_name "$work_dir/release.json")
+          if [[ "$latest_tag" != v* ]]; then
+            echo "Unexpected tag_name: $latest_tag" >&2
+            exit 1
+          fi
+          # Fetched on every run: upstream may move a published tag, and the
+          # LICENSE source follows the tag.
+          if ! curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+              "https://raw.githubusercontent.com/can1357/oh-my-pi/${latest_tag}/LICENSE" \
+              -o "$work_dir/LICENSE"; then
+            echo "Unable to download LICENSE for ${latest_tag}." >&2
+            exit 1
+          fi
+
+          python3 - "$work_dir/release.json" "$work_dir/LICENSE" <<'PY'
           import hashlib
           import json
           import os
           import re
           import sys
-          import time
-          import urllib.error
-          import urllib.request
+          from pathlib import Path
 
-          RELEASE_URL = "https://api.github.com/repos/can1357/oh-my-pi/releases/latest"
-          MAX_FETCH_ATTEMPTS = 4
-          MAX_FETCH_RETRY_SECONDS = 300
-
-          def request_headers(url):
-              headers = {"User-Agent": "oh-my-pi-aur-updater"}
-              token = os.environ.get("GITHUB_TOKEN")
-              if token and url.startswith("https://api.github.com/"):
-                  headers["Accept"] = "application/vnd.github+json"
-                  headers["Authorization"] = f"Bearer {token}"
-                  headers["X-GitHub-Api-Version"] = "2022-11-28"
-              return headers
-
-          def is_rate_limited(error):
-              return error.code == 403 and error.msg == "rate limit exceeded"
-
-          def retry_delay(error, attempt):
-              headers = error.headers or {}
-              retry_after = headers.get("Retry-After")
-              if retry_after and retry_after.isdigit():
-                  return min(MAX_FETCH_RETRY_SECONDS, max(1, int(retry_after)))
-              reset = headers.get("X-RateLimit-Reset")
-              if reset and reset.isdigit():
-                  reset_delay = int(reset) - int(time.time()) + 5
-                  return min(MAX_FETCH_RETRY_SECONDS, max(1, reset_delay))
-              return min(MAX_FETCH_RETRY_SECONDS, 2 ** attempt)
-
-          def fetch(url):
-              for attempt in range(MAX_FETCH_ATTEMPTS):
-                  req = urllib.request.Request(url, headers=request_headers(url))
-                  try:
-                      with urllib.request.urlopen(req, timeout=30) as response:
-                          return response.read()
-                  except urllib.error.HTTPError as error:
-                      if not is_rate_limited(error) or attempt == MAX_FETCH_ATTEMPTS - 1:
-                          raise
-                      delay = retry_delay(error, attempt)
-                      print(
-                          f"GitHub rate limit hit for {url}; retrying in {delay}s "
-                          f"({attempt + 2}/{MAX_FETCH_ATTEMPTS})",
-                          file=sys.stderr,
-                      )
-                      time.sleep(delay)
-              raise AssertionError("unreachable")
-
-          def fetch_json(url):
-              return json.loads(fetch(url).decode("utf-8"))
-
-          def fetch_bytes(url):
-              return fetch(url)
+          BINARY_ASSETS = {
+              "sha256sums_x86_64": "omp-linux-x64",
+              "sha256sums_aarch64": "omp-linux-arm64",
+          }
 
           def version_tuple(value):
               return tuple(int(part) for part in value.split("."))
@@ -136,64 +106,81 @@ jobs:
                   if asset.get("name") != asset_name:
                       continue
                   digest = asset.get("digest") or ""
-                  if not digest:
-                      raise SystemExit(f"Asset {asset_name} has no digest")
-                  return digest[7:] if digest.startswith("sha256:") else digest
+                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                      raise SystemExit(f"Asset {asset_name} has no sha256 digest: {digest!r}")
+                  return digest.removeprefix("sha256:")
               raise SystemExit(f"Asset {asset_name} not found")
 
-          def replace_sha256sum(content, name, checksum):
+          def read_assignment(content, name, value_pattern):
+              match = re.search(
+                  rf"^{re.escape(name)}={value_pattern}$", content, flags=re.MULTILINE
+              )
+              if not match:
+                  raise SystemExit(f"Could not find {name} in PKGBUILD")
+              return match.group(1)
+
+          def read_sha256sum(content, name):
+              return read_assignment(content, name, r"\('([0-9a-f]{64})'\)")
+
+          def replace_assignment(content, name, value):
               content, replaced = re.subn(
-                  rf"^{re.escape(name)}=\('[0-9a-f]+'\)$",
-                  f"{name}=('{checksum}')",
+                  rf"^{re.escape(name)}=.*$",
+                  lambda _: f"{name}={value}",
                   content,
                   count=1,
                   flags=re.MULTILINE,
               )
               if replaced != 1:
-                  raise SystemExit(f"Could not find {name} checksum line in PKGBUILD")
+                  raise SystemExit(f"Could not find {name} in PKGBUILD")
               return content
 
-          content = open("PKGBUILD", encoding="utf-8").read()
-          match = re.search(r"^pkgver=(\S+)", content, re.MULTILINE)
-          if not match:
-              raise SystemExit("Could not find pkgver in PKGBUILD")
-          current = match.group(1)
-
-          release = fetch_json(RELEASE_URL)
-          tag_name = release.get("tag_name", "")
-          if not tag_name.startswith("v"):
-              raise SystemExit(f"Unexpected tag_name: {tag_name}")
-          latest = tag_name[1:]
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"version={latest}\n")
-
-          if version_tuple(latest) <= version_tuple(current):
+          def write_outputs(**values):
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("changed=false\n")
-              print(f"already up to date: {current}")
+                  for key, value in values.items():
+                      output.write(f"{key}={value}\n")
+
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          latest = release["tag_name"][1:]
+          assets = release.get("assets", [])
+          checksums = {"sha256sums": hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest()}
+          for name, asset_name in BINARY_ASSETS.items():
+              checksums[name] = asset_sha256(assets, asset_name)
+
+          content = Path("PKGBUILD").read_text(encoding="utf-8")
+          current = read_assignment(content, "pkgver", r"(\S+)")
+          current_pkgrel = read_assignment(content, "pkgrel", r"(\S+)")
+
+          if version_tuple(latest) < version_tuple(current):
+              write_outputs(changed="false")
+              print(f"PKGBUILD {current} is newer than latest release {latest}")
               sys.exit(0)
 
-          assets = release.get("assets", [])
-          x86_64_binary_sha = asset_sha256(assets, "omp-linux-x64")
-          aarch64_binary_sha = asset_sha256(assets, "omp-linux-arm64")
-          license_bytes = fetch_bytes(f"https://raw.githubusercontent.com/can1357/oh-my-pi/v{latest}/LICENSE")
-          license_sha = hashlib.sha256(license_bytes).hexdigest()
+          if version_tuple(latest) == version_tuple(current):
+              pinned = {name: read_sha256sum(content, name) for name in checksums}
+              stale = [name for name, checksum in checksums.items() if pinned[name] != checksum]
+              if not stale:
+                  write_outputs(changed="false")
+                  print(f"already up to date: {current}-{current_pkgrel}")
+                  sys.exit(0)
+              # Upstream replaced files of a published release (e.g. moved the
+              # tag and re-uploaded assets); a new pkgrel makes existing
+              # installs pick up the replacements.
+              for name in stale:
+                  print(f"{name}: {pinned[name]} -> {checksums[name]}")
+              pkgrel = str(int(current_pkgrel.split(".")[0]) + 1)
+              message = f"update checksums for re-uploaded {latest} assets"
+          else:
+              pkgrel = "1"
+              message = f"upstream release: {latest}"
 
-          content = re.sub(r"^pkgver=\S+", f"pkgver={latest}", content, flags=re.MULTILINE)
-          content = re.sub(r"^pkgrel=\S+", "pkgrel=1", content, flags=re.MULTILINE)
-          content = replace_sha256sum(content, "sha256sums", license_sha)
-          content = replace_sha256sum(
-              content, "sha256sums_x86_64", x86_64_binary_sha
-          )
-          content = replace_sha256sum(
-              content, "sha256sums_aarch64", aarch64_binary_sha
-          )
-          open("PKGBUILD", "w", encoding="utf-8").write(content)
+          content = replace_assignment(content, "pkgver", latest)
+          content = replace_assignment(content, "pkgrel", pkgrel)
+          for name, checksum in checksums.items():
+              content = replace_assignment(content, name, f"('{checksum}')")
+          Path("PKGBUILD").write_text(content, encoding="utf-8")
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("changed=true\n")
-          print(f"updated: {current} -> {latest}")
+          write_outputs(changed="true", message=message)
+          print(f"updated: {current}-{current_pkgrel} -> {latest}-{pkgrel}")
           PY
 
           changed=$(awk -F= '$1 == "changed" { value = $2 } END { print value }' "$GITHUB_OUTPUT")
@@ -331,7 +318,7 @@ jobs:
 
       - name: Commit and push
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT_MESSAGE: ${{ needs.prepare.outputs.message }}
         run: |
           set -euo pipefail
           cp updated/PKGBUILD updated/.SRCINFO aur/
@@ -343,7 +330,7 @@ jobs:
           git config user.name 'Bin Jin'
           git config user.email 'bjin@protonmail.com'
           git add PKGBUILD .SRCINFO
-          git commit -m "upstream release: ${VERSION}"
+          git commit -m "$COMMIT_MESSAGE"
           max_push_attempts=4
           push_attempt=1
           while ! git push origin master; do
