@@ -191,16 +191,7 @@ jobs:
             exit 1
           fi
           tarball_checksum=$(sha256sum "$tarball" | cut -d ' ' -f 1)
-          if ! tar -xzOf "$tarball" "oh-my-pi-${latest_version}/Cargo.lock" > "$lockfile"; then
-            echo "Unable to extract Cargo.lock from the v${latest_version} source tarball." >&2
-            exit 1
-          fi
-          if ! tar -xzOf "$tarball" \
-              "oh-my-pi-${latest_version}/crates/pi-ast/src/language/wasm_grammars.rs" \
-              > "$grammar_file"; then
-            echo "Unable to extract wasm_grammars.rs from the v${latest_version} source tarball." >&2
-            exit 1
-          fi
+          bash "$GITHUB_WORKSPACE/scripts/extract_release_metadata.sh" "$tarball" "$latest_version" "$work_dir"
           grammar_metadata=$(
             python3 "$GITHUB_WORKSPACE/scripts/update_grammar_release.py" "$grammar_file" PKGBUILD
           )

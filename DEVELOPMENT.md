@@ -1,5 +1,9 @@
 # Development
 
+## AUR release updates
+
+The update workflow expects the v19+ AUR recipe. It reads the `opus` pin from the release's root `Cargo.lock` and the grammar pin from `crates/ast/src/language/wasm_grammars.rs`. Packaging changes such as retargeting patches or renaming the Cargo build target belong in the AUR checkout. Push the manual AUR update first: if that `pkgver-pkgrel` is not yet published, the workflow builds it without bumping it again.
+
 ## Daily minimum-Rust check
 
 [`check-oh-my-pi-rust-min.yml`](.github/workflows/check-oh-my-pi-rust-min.yml) runs daily at **05:43 UTC** and can also be started with **Run workflow** in GitHub Actions:

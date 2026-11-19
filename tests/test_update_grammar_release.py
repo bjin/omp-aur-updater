@@ -1,4 +1,7 @@
 import importlib.util
+import io
+import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +27,28 @@ class GrammarReleaseTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.registry = Path(temporary.name) / "wasm_grammars.rs"
         self.pkgbuild = Path(temporary.name) / "PKGBUILD"
+
+    def test_v19_release_archive_updates_grammar_pin(self) -> None:
+        work = self.pkgbuild.parent
+        archive = work / "release.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, data in (
+                ("Cargo.lock", b"workspace lock"),
+                ("crates/ast/src/language/wasm_grammars.rs", header("2")),
+                ("sdk/rust/omp-rpc/Cargo.lock", b"unrelated lock"),
+            ):
+                member = tarfile.TarInfo(f"oh-my-pi-19.0.0/{name}")
+                member.size = len(data)
+                tar.addfile(member, io.BytesIO(data))
+
+        subprocess.run(
+            ["bash", MODULE_PATH.with_name("extract_release_metadata.sh"), archive, "19.0.0", work],
+            check=True,
+        )
+        self.assertEqual(b"workspace lock", (work / "Cargo.lock").read_bytes())
+        self.pkgbuild.write_text("_grammar_release=1\n")
+        updater.update_grammar_release(self.registry, self.pkgbuild)
+        self.assertEqual('_grammar_release="2"\n', self.pkgbuild.read_text())
 
     def test_changed_pin_preserves_other_package_metadata(self) -> None:
         self.registry.write_bytes(header("2.10") + b"//! not edit.\n")
